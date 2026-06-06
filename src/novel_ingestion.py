@@ -2,10 +2,12 @@
 
 import os
 import re
+import io
 import uuid
 from datetime import datetime, timezone
 
 from fastapi import UploadFile, HTTPException
+from bs4 import BeautifulSoup
 
 from .config import MAX_FILE_SIZE, ALLOWED_EXTENSIONS, CHAPTER_PATTERNS
 
@@ -99,8 +101,196 @@ def split_chapters(text: str) -> list[tuple[str, str]]:
 
 
 # ============================================================
-# 上传入口（被 main.py 的路由调用）
+# EPUB 提取
 # ============================================================
+
+def extract_epub(file_bytes: bytes, filename: str) -> tuple[str, list[tuple[str, str]]]:
+    """
+    从 EPUB 文件中提取章节文本
+
+    EPUB 本身就是按章节组织的，不需要 split_chapters()。
+    用 ebooklib 解析 ZIP 结构，BeautifulSoup 提取 HTML 中的纯文本。
+
+    Args:
+        file_bytes: EPUB 文件的原始字节
+        filename: 原始文件名（用于推断标题）
+
+    Returns:
+        (title, chapters) — title 是书名，chapters 是 [(标题, 内容), ...]
+
+    Raises:
+        HTTPException: EPUB 解析失败或章节不足
+    """
+    import ebooklib
+    from ebooklib import epub
+
+    try:
+        book = epub.read_epub(io.BytesIO(file_bytes))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"EPUB 文件解析失败: {e}")
+
+    # 取书名（优先用元数据，否则用文件名）
+    titles = book.get_metadata("DC", "title")
+    book_title = titles[0][0] if titles else os.path.splitext(filename or "未命名")[0]
+
+    # 获取所有 HTML 文档
+    documents = list(book.get_items_of_type(ebooklib.ITEM_DOCUMENT))
+
+    chapters = []
+    for i, doc in enumerate(documents):
+        # 用 BeautifulSoup 提取纯文本
+        soup = BeautifulSoup(doc.get_content(), "html.parser")
+        text = soup.get_text()
+
+        # 清洗文本
+        text = clean_text(text)
+        if not text or len(text) < 50:
+            continue
+
+        # 取第一行作为候选标题
+        first_line = text.split("\n")[0].strip()
+        ch_title = first_line if len(first_line) <= 30 else ""
+
+        chapters.append((ch_title, text))
+
+    # 检测并分离尾注/注释（正文末尾的注释应独立成段）
+    chapters = _split_annotations(chapters)
+
+    # 过滤非正文内容（版权页、CIP 等纯元数据，保留序言）
+    chapters = _filter_body_chapters(chapters)
+
+    # 如果正文只有一个大段落（非标准 EPUB），尝试拆章
+    if len(chapters) < 3:
+        body_text = "\n\n".join(t + "\n\n" + c for t, c in chapters)
+        # 策略1：正则找章节标记
+        try:
+            split = split_chapters(body_text)
+            if len(split) >= 3:
+                chapters = split
+        except ValueError:
+            pass
+
+    # 策略2：如果仍不足 3 章且 body 只有一个大段落，按字数均分（兜底）
+    # 仅当 chapters 只有 1-2 个条目时触发，不会丢弃其他有效章节
+    if len(chapters) < 3 and len(chapters) == 1:
+        _, body_text = chapters[0]
+        if len(body_text) > 6000:
+            chapters = _split_by_length(body_text, target_chars=4000)
+
+    if len(chapters) < 3:
+        raise HTTPException(
+            status_code=400,
+            detail=f"EPUB 正文中只找到 {len(chapters)} 个章节，至少需要 3 个（已自动过滤前言/目录/版权/附录）"
+        )
+
+    return book_title, chapters
+
+
+def _split_by_length(text: str, target_chars: int = 4000) -> list[tuple[str, str]]:
+    """
+    按字数均分长文本（兜底策略，用于无章节标记的流水叙事小说）
+
+    在段落边界处切分，避免切断句子。
+    """
+    paragraphs = text.split("\n\n")
+    chapters = []
+    current = []
+    current_len = 0
+    part_num = 0
+
+    for para in paragraphs:
+        current.append(para)
+        current_len += len(para)
+        if current_len >= target_chars:
+            part_num += 1
+            ch_title = f"第{part_num}部分"
+            chapters.append((ch_title, "\n\n".join(current)))
+            current = []
+            current_len = 0
+
+    # 收尾
+    if current:
+        part_num += 1
+        ch_title = f"第{part_num}部分"
+        chapters.append((ch_title, "\n\n".join(current)))
+
+    return chapters
+
+
+def _split_annotations(chapters: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """
+    检测并分离尾注/注释
+
+    如果某章节末尾含大量单独成行的"注：""注释"等标记，
+    将其拆分为正文 + 注释两个独立段。
+    """
+    ANNOTATION_MARKERS = [
+        r'注释',       # "注释"（最宽泛匹配，能覆盖"注释　　⑴"等）
+        r'【注】',      # "【注】"
+        r'\n注\s*[：:]',# 行首"注："
+    ]
+    combined = "|".join(ANNOTATION_MARKERS)
+
+    result = []
+    for title, text in chapters:
+        match = re.search(combined, text)
+        if match and match.start() > len(text) * 0.3:
+            split_pos = match.start()
+            body_text = text[:split_pos].strip()
+            notes_text = text[split_pos:].strip()
+
+            # 验证：切分后的"注释"部分至少有 2 个编号条目
+            numbered_items = len(re.findall(r'[（(]\d+[）)]', notes_text[:1000]))
+            is_likely_endnotes = numbered_items >= 2
+
+            if is_likely_endnotes and len(body_text) > 200 and len(notes_text) > 50:
+                result.append((title, body_text))
+                notes_title = title + " 注释" if title else "注释"
+                result.append((notes_title, notes_text))
+                continue
+
+        result.append((title, text))
+
+    return result
+
+
+def _filter_body_chapters(raw: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """
+    过滤掉非正文章节（版权、序言、目录、附录、后记等）
+
+    识别规则：
+    - 标题含非正文关键字
+    - 内容极短（< 100 字）且不含章节标记
+    - 纯目录页（多次出现"第X章"模式）
+    """
+    SKIP_KEYWORDS = [
+        "出版", "编目", "CIP", "ISBN", "插图", "人物表",
+    ]
+
+    body = []
+    for title, text in raw:
+        # 标题含跳过关键字
+        skip = False
+        for kw in SKIP_KEYWORDS:
+            if kw in title:
+                skip = True
+                break
+        if skip:
+            continue
+
+        # 纯目录页检测
+        markers = len(re.findall(r"第[零一二三四五六七八九十百千0-9]+[章节]", text[:500]))
+        if markers >= 3:
+            continue
+
+        # 极短内容（扉页、空白页）跳过
+        if len(text) < 100:
+            continue
+
+        body.append((title, text))
+
+    return body
+
 
 async def upload_novel(file: UploadFile, db) -> dict:
     """
@@ -119,7 +309,7 @@ async def upload_novel(file: UploadFile, db) -> dict:
     # 1. 检查文件后缀
     ext = os.path.splitext(file.filename or "")[1].lower()
     if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"不支持的文件格式 {ext}，请上传 .txt 文件")
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式 {ext}，请上传 .txt 或 .epub 文件")
 
     # 2. 读取文件内容
     content = await file.read()
@@ -129,26 +319,27 @@ async def upload_novel(file: UploadFile, db) -> dict:
         size_mb = len(content) / (1024 * 1024)
         raise HTTPException(status_code=400, detail=f"文件过大（{size_mb:.1f}MB），上限 1MB")
 
-    # 4. 解码为文本（尝试 UTF-8，失败尝试 GBK）
-    try:
-        text = content.decode("utf-8")
-    except UnicodeDecodeError:
+    # 4. 根据格式分别处理
+    if ext == ".epub":
+        # EPUB：章节结构内嵌，无需分章
+        title, chapters = extract_epub(content, file.filename)
+        text = "\n\n".join(f"{t}\n\n{c}" for t, c in chapters)
+    else:
+        # TXT：解码 → 清洗 → 正则分章
         try:
-            text = content.decode("gbk")
+            text = content.decode("utf-8")
         except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="文件编码错误，请使用 UTF-8 或 GBK 编码")
+            try:
+                text = content.decode("gbk")
+            except UnicodeDecodeError:
+                raise HTTPException(status_code=400, detail="文件编码错误，请使用 UTF-8 或 GBK 编码")
 
-    # 5. 清洗文本
-    text = clean_text(text)
-
-    # 6. 分章
-    try:
-        chapters = split_chapters(text)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # 7. 从文件名推断标题
-    title = os.path.splitext(file.filename or "未命名")[0]
+        text = clean_text(text)
+        try:
+            chapters = split_chapters(text)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        title = os.path.splitext(file.filename or "未命名")[0]
 
     # 8. 写入数据库
     novel_id = str(uuid.uuid4())

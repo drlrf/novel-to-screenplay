@@ -12,12 +12,12 @@
 """
 
 import json
-import re
+import asyncio
 import difflib
 from dataclasses import dataclass, field, asdict
 from typing import Optional
 
-from .llm_client import OllamaClient, LLMError
+from .exceptions import LLMError
 from .chunker import TextChunk
 from .prompt_registry import (
     CHARACTER_EXTRACTION_PROMPT,
@@ -93,7 +93,7 @@ class NarrativeData:
 class Stage1Extractor:
     """编排 Stage 1 的三个提取步骤"""
 
-    def __init__(self, llm: OllamaClient):
+    def __init__(self, llm):  # llm: OllamaClient or DeepSeekClient
         self.llm = llm
 
     async def run(self, chunks: list[TextChunk]) -> NarrativeData:
@@ -130,26 +130,21 @@ class Stage1Extractor:
     # ============================================================
 
     async def _extract_characters(self, chunks: list[TextChunk]) -> list[dict]:
-        """
-        对每个 chunk 调 LLM 提取角色
-
-        Returns:
-            所有 chunk 的角色列表（未去重），每个元素是 Character 的 dict 形式
-        """
-        all_chars = []
-        for chunk in chunks:
+        """对所有 chunk 并发调 LLM 提取角色"""
+        async def extract_one(chunk):
             prompt = CHARACTER_EXTRACTION_PROMPT.format(chapter_text=chunk.text)
             try:
                 result = await self.llm.generate_json(prompt)
                 chars = result.get("characters", [])
-                # 标注来源 chunk，方便调试
                 for c in chars:
                     c["_source_chunk"] = chunk.chunk_index
-                all_chars.extend(chars)
+                return chars
             except LLMError as e:
                 print(f"[Stage1] 角色提取失败 (chunk {chunk.chunk_index}): {e}")
-                continue
-        return all_chars
+                return []
+
+        results = await asyncio.gather(*[extract_one(c) for c in chunks])
+        return [c for r in results for c in r]
 
     def _aggregate_characters(self, raw_chars: list[dict]) -> list[Character]:
         """
@@ -231,20 +226,21 @@ class Stage1Extractor:
     # ============================================================
 
     async def _extract_scenes(self, chunks: list[TextChunk]) -> list[dict]:
-        """对每个 chunk 调 LLM 识别场景"""
-        all_scenes = []
-        for chunk in chunks:
+        """对所有 chunk 并发调 LLM 识别场景"""
+        async def extract_one(chunk):
             prompt = SCENE_IDENTIFICATION_PROMPT.format(chapter_text=chunk.text)
             try:
                 result = await self.llm.generate_json(prompt)
                 scenes = result.get("scenes", [])
                 for s in scenes:
                     s["_source_chunk"] = chunk.chunk_index
-                all_scenes.extend(scenes)
+                return scenes
             except LLMError as e:
                 print(f"[Stage1] 场景识别失败 (chunk {chunk.chunk_index}): {e}")
-                continue
-        return all_scenes
+                return []
+
+        results = await asyncio.gather(*[extract_one(c) for c in chunks])
+        return [s for r in results for s in r]
 
     def _merge_scenes(self, raw_scenes: list[dict]) -> list[Scene]:
         """
@@ -263,12 +259,13 @@ class Stage1Extractor:
             key = f"{location}|{time}"
 
             if key in seen_keys:
-                # 同一场景：合并 actions
-                existing = scenes[-1]
-                new_actions = raw.get("actions", [])
-                for a in new_actions:
-                    if a not in existing.actions:
-                        existing.actions.append(a)
+                # 同一场景：找到已存在的场景并合并 actions
+                existing = next((s for s in scenes if s.location == location and s.time == time), None)
+                if existing:
+                    new_actions = raw.get("actions", [])
+                    for a in new_actions:
+                        if a not in existing.actions:
+                            existing.actions.append(a)
             else:
                 seen_keys.add(key)
                 scenes.append(Scene(
@@ -290,14 +287,13 @@ class Stage1Extractor:
     # ============================================================
 
     async def _extract_dialogues(self, chunks: list[TextChunk], characters: list[Character]) -> list[dict]:
-        """对每个 chunk 调 LLM 提取对白"""
+        """对所有 chunk 并发调 LLM 提取对白"""
         char_list_json = json.dumps(
             [{"name": c.name, "id": c.id} for c in characters],
             ensure_ascii=False,
         )
 
-        all_dialogues = []
-        for chunk in chunks:
+        async def extract_one(chunk):
             prompt = DIALOGUE_EXTRACTION_PROMPT.format(
                 chapter_text=chunk.text,
                 character_list_json=char_list_json,
@@ -307,12 +303,13 @@ class Stage1Extractor:
                 dialogues = result.get("dialogues", [])
                 for d in dialogues:
                     d["_source_chunk"] = chunk.chunk_index
-                all_dialogues.extend(dialogues)
+                return dialogues
             except LLMError as e:
                 print(f"[Stage1] 对白提取失败 (chunk {chunk.chunk_index}): {e}")
-                continue
+                return []
 
-        return all_dialogues
+        results = await asyncio.gather(*[extract_one(c) for c in chunks])
+        return [d for r in results for d in r]
 
     def _number_dialogues(self, raw_dialogues: list[dict]) -> list[Dialogue]:
         """将对白全局编号并转换为 Dialogue 对象"""

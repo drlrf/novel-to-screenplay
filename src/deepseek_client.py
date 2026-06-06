@@ -1,89 +1,58 @@
-"""Ollama LLM 客户端封装"""
+"""DeepSeek API 客户端 — OpenAI 兼容接口"""
 
 import json
 import asyncio
 import httpx
 
-from .config import OLLAMA_BASE_URL, MODEL_NAME, LLM_TIMEOUT, LLM_MAX_RETRIES
+from .config import DEEPSEEK_BASE_URL, DEEPSEEK_API_KEY, DEEPSEEK_MODEL, LLM_TIMEOUT, LLM_MAX_RETRIES
 
 
 from .exceptions import LLMError
 
 
-class OllamaClient:
-    """封装 Ollama API 调用，提供 chat / generate / generate_json 三种模式"""
+class DeepSeekClient:
+    """DeepSeek API 封装，接口与 OllamaClient 一致"""
 
-    def __init__(self, base_url: str = OLLAMA_BASE_URL, model: str = MODEL_NAME):
+    def __init__(self, base_url: str = DEEPSEEK_BASE_URL, model: str = DEEPSEEK_MODEL):
         self.base_url = base_url
         self.model = model
+        self._headers = {
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+            "Content-Type": "application/json",
+        }
 
     # ============================================================
     # 公开方法
     # ============================================================
 
     async def chat(self, messages: list[dict], temperature: float = 0.3) -> str:
-        """
-        多轮对话模式（调 /api/chat）
-
-        Args:
-            messages: [{"role": "user", "content": "..."}, ...]
-            temperature: 创造性参数（0=确定性, 1=随机）
-
-        Returns:
-            模型回复文本
-        """
+        """多轮对话"""
         payload = {
             "model": self.model,
             "messages": messages,
-            "stream": False,
-            "options": {"temperature": temperature},
+            "temperature": temperature,
         }
-        data = await self._post("/api/chat", payload)
-        return data["message"]["content"]
+        data = await self._post("/chat/completions", payload)
+        return data["choices"][0]["message"]["content"]
 
     async def generate(self, prompt: str, temperature: float = 0.3) -> str:
-        """
-        单次生成模式（调 /api/generate）
-
-        Args:
-            prompt: 提示词文本
-            temperature: 创造性参数
-
-        Returns:
-            模型生成文本
-        """
-        payload = {
-            "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "options": {"temperature": temperature},
-        }
-        data = await self._post("/api/generate", payload)
-        return data["response"]
+        """单次生成（封装为单条 user message）"""
+        messages = [{"role": "user", "content": prompt}]
+        return await self.chat(messages, temperature)
 
     async def generate_json(self, prompt: str, temperature: float = 0.1) -> dict:
-        """
-        单次生成 + JSON 约束（调 /api/generate，format="json"）
-
-        Args:
-            prompt: 提示词文本（需包含 JSON 输出格式说明）
-            temperature: 创造性参数（默认 0.1，追求精确）
-
-        Returns:
-            解析后的 dict
-
-        Raises:
-            LLMError: JSON 解析失败
-        """
+        """单次生成 + JSON 约束"""
+        # DeepSeek 的 JSON mode 需要在 prompt 中明确提到 JSON，
+        # 且用 response_format 参数约束
+        messages = [{"role": "user", "content": prompt}]
         payload = {
             "model": self.model,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-            "options": {"temperature": temperature},
+            "messages": messages,
+            "temperature": temperature,
+            "response_format": {"type": "json_object"},
         }
-        data = await self._post("/api/generate", payload)
-        raw_text = data["response"]
+        data = await self._post("/chat/completions", payload)
+        raw_text = data["choices"][0]["message"]["content"]
 
         try:
             return self._extract_json(raw_text)
@@ -95,18 +64,21 @@ class OllamaClient:
     # ============================================================
 
     async def _post(self, endpoint: str, payload: dict) -> dict:
-        """发送 POST 请求到 Ollama API（带重试）"""
-
+        """发送 POST 请求（带重试）"""
         async def do_request():
             async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
-                resp = await client.post(self.base_url + endpoint, json=payload)
+                resp = await client.post(
+                    self.base_url + endpoint,
+                    json=payload,
+                    headers=self._headers,
+                )
                 resp.raise_for_status()
                 return resp.json()
 
         return await self._retry(do_request, label=endpoint)
 
     async def _retry(self, fn, label: str = ""):
-        """重试编排器（指数退避：0.5s → 1s → 2s）"""
+        """重试编排器（指数退避）"""
         last_error = None
         for attempt in range(LLM_MAX_RETRIES):
             try:
@@ -114,23 +86,23 @@ class OllamaClient:
             except (httpx.HTTPError, httpx.TimeoutException) as e:
                 last_error = e
                 delay = 0.5 * (2 ** attempt)
-                print(f"[{label}] 第{attempt+1}次失败: {e}，{delay}s 后重试")
+                print(f"[DeepSeek:{label}] 第{attempt+1}次失败: {e}，{delay}s 后重试")
                 await asyncio.sleep(delay)
 
         raise LLMError(f"{label} 重试 {LLM_MAX_RETRIES} 次后仍失败: {last_error}")
 
     @staticmethod
     def _extract_json(raw_text: str) -> dict:
-        """从 LLM 返回文本中提取 JSON，处理 markdown 代码块包裹等情况"""
+        """从返回文本中提取 JSON"""
         text = raw_text.strip()
 
-        # 去掉 markdown 代码块标记（```json 或 ```）
+        # 去掉 markdown 代码块
         if "```" in text:
             lines = text.split("\n")
             lines = [l for l in lines if not l.strip().startswith("```")]
             text = "\n".join(lines).strip()
 
-        # 优先尝试 {} 对象
+        # 优先 {} 对象
         left = text.find("{")
         right = text.rfind("}")
         if left != -1 and right != -1 and right > left:
@@ -148,5 +120,4 @@ class OllamaClient:
             except json.JSONDecodeError:
                 pass
 
-        # 最后原样解析，失败抛异常
-        raise json.JSONDecodeError("无法从文本中提取合法 JSON", text, 0)
+        raise json.JSONDecodeError("无法提取 JSON", text, 0)
