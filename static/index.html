@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 小说转剧本工具</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #f5f5f5; color: #333; }
+  .app { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 22px; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  .card { background: #fff; border-radius: 8px; padding: 20px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+  .card h2 { font-size: 16px; margin-bottom: 16px; color: #666; }
+  .full { grid-column: 1 / -1; }
+
+  /* 上传区 */
+  .upload-zone { border: 2px dashed #ddd; border-radius: 8px; padding: 40px; text-align: center; cursor: pointer; transition: border-color .2s; }
+  .upload-zone:hover, .upload-zone.drag { border-color: #4a90d9; }
+  .upload-zone input { display: none; }
+  .upload-zone .icon { font-size: 36px; margin-bottom: 8px; }
+
+  /* 章节选择 */
+  .chapter-list { max-height: 200px; overflow-y: auto; }
+  .chapter-item { display: flex; align-items: center; padding: 6px 0; border-bottom: 1px solid #f0f0f0; }
+  .chapter-item label { flex: 1; cursor: pointer; }
+  .chapter-item .count { color: #999; font-size: 13px; }
+
+  /* 进度 */
+  .progress-bar { background: #eee; border-radius: 4px; height: 8px; margin: 12px 0; overflow: hidden; }
+  .progress-fill { background: #4a90d9; height: 100%; width: 0; transition: width .3s; }
+  .progress-detail { font-size: 13px; color: #666; }
+
+  /* 按钮 */
+  .btn { padding: 10px 24px; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; transition: opacity .2s; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-primary { background: #4a90d9; color: #fff; }
+  .btn-outline { background: #fff; color: #4a90d9; border: 1px solid #4a90d9; }
+  .btn-group { display: flex; gap: 8px; margin-top: 16px; }
+
+  /* YAML 预览 */
+  .yaml-preview { background: #1e1e1e; color: #d4d4d4; border-radius: 8px; padding: 20px; font-family: "Cascadia Code", "Fira Code", monospace; font-size: 13px; line-height: 1.6; max-height: 600px; overflow: auto; white-space: pre-wrap; }
+  .yaml-preview .key { color: #569cd6; }
+  .yaml-preview .string { color: #ce9178; }
+  .yaml-preview .comment { color: #6a9955; }
+  .yaml-preview .number { color: #b5cea8; }
+  .empty-state { color: #999; text-align: center; padding: 60px 0; }
+
+  /* 状态标签 */
+  .tag { display: inline-block; padding: 2px 8px; border-radius: 4px; font-size: 12px; }
+  .tag-ok { background: #e6f7e6; color: #389e0d; }
+  .tag-err { background: #fff2f0; color: #cf1322; }
+  .tag-info { background: #e6f0ff; color: #1890ff; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>🎬 AI 小说转剧本工具</h1>
+
+  <div class="grid">
+    <!-- 左侧：上传 + 章节 -->
+    <div class="card">
+      <h2>① 上传小说</h2>
+      <div class="upload-zone" id="uploadZone">
+        <div class="icon">📁</div>
+        <div>拖拽 .txt 或 .epub 文件到此处，或点击选择</div>
+        <div style="font-size:12px;color:#999;margin-top:4px">支持 UTF-8 / GBK 编码</div>
+        <input type="file" id="fileInput" accept=".txt,.epub">
+      </div>
+      <div id="uploadStatus" style="margin-top:8px;font-size:13px"></div>
+    </div>
+
+    <div class="card">
+      <h2>② 选择章节（至少 3 章）</h2>
+      <div id="chapterList" class="chapter-list">
+        <div class="empty-state">请先上传小说文件</div>
+      </div>
+      <div id="chapterInfo" style="font-size:13px;color:#999;margin-top:4px"></div>
+    </div>
+
+    <!-- 进度 -->
+    <div class="card" id="progressCard" style="display:none">
+      <h2>③ 转换进度</h2>
+      <div id="progressStage" class="progress-detail"></div>
+      <div class="progress-bar"><div class="progress-fill" id="progressFill"></div></div>
+      <div id="progressPercent" style="font-size:13px;color:#999"></div>
+    </div>
+
+    <!-- YAML 预览 -->
+    <div class="card full">
+      <h2>④ 剧本输出 <span id="outputTag"></span></h2>
+      <div id="yamlOutput" class="empty-state">等待转换完成...</div>
+      <div class="btn-group" id="outputActions" style="display:none">
+        <button class="btn btn-primary" onclick="downloadYaml()">⬇ 下载 YAML</button>
+        <button class="btn btn-outline" onclick="copyYaml()">📋 复制到剪贴板</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
