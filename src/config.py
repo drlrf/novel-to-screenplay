@@ -1,6 +1,9 @@
 """配置常量"""
 
 import os
+from dotenv import load_dotenv
+
+load_dotenv()  # 从项目根目录 .env 文件加载环境变量
 
 # 项目根目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
