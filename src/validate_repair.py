@@ -7,7 +7,7 @@
 import json
 
 from .config import MAX_REPAIR_CYCLES
-from .llm_client import OllamaClient, LLMError
+from .exceptions import LLMError
 from .schema_validator import ScreenplayValidator, ValidationError
 from .prompt_registry import REPAIR_PROMPT
 
@@ -20,7 +20,7 @@ class RepairFailedError(Exception):
 class RepairLoop:
     """编排修复循环"""
 
-    def __init__(self, llm: OllamaClient):
+    def __init__(self, llm):  # llm: OllamaClient or DeepSeekClient
         self.llm = llm
         self.validator = ScreenplayValidator()
 
@@ -78,10 +78,13 @@ class RepairLoop:
         Returns:
             修复后的 JSON dict
         """
-        # 格式化错误列表
+        # 格式化错误列表（过多的错误会让修复 Prompt 太大，限 20 条）
+        max_show = 20
         error_lines = []
-        for e in errors:
+        for e in errors[:max_show]:
             error_lines.append(f"  - 字段 {e.field}: {e.message}")
+        if len(errors) > max_show:
+            error_lines.append(f"  ... 还有 {len(errors) - max_show} 个错误未列出")
         error_text = "\n".join(error_lines)
 
         # 格式化 JSON（带缩进，方便 LLM 阅读）
