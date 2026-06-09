@@ -10,7 +10,7 @@
 import json
 from datetime import datetime, timezone
 
-from .llm_client import OllamaClient, LLMError
+from .exceptions import LLMError
 from .stage1_extraction import NarrativeData
 from .schema_validator import ScreenplayValidator
 from .validate_repair import RepairLoop, RepairFailedError
@@ -21,7 +21,7 @@ from .prompt_registry import SCENE_ASSEMBLY_PROMPT
 class Stage2Converter:
     """编排 Stage 2 转换流程"""
 
-    def __init__(self, llm: OllamaClient):
+    def __init__(self, llm):  # llm: OllamaClient or DeepSeekClient
         self.llm = llm
         self.repair = RepairLoop(llm)
 
