@@ -7,9 +7,7 @@ import httpx
 from .config import OLLAMA_BASE_URL, MODEL_NAME, LLM_TIMEOUT, LLM_MAX_RETRIES
 
 
-class LLMError(Exception):
-    """LLM 调用失败异常"""
-    pass
+from .exceptions import LLMError
 
 
 class OllamaClient:
